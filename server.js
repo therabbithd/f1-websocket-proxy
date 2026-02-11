@@ -75,7 +75,8 @@ async function startF1Broker() {
                 A: [[
                     'Heartbeat', 'CarData.z', 'Position.z', 'ExtrapolatedClock', 'TimingStats',
                     'TimingAppData', 'WeatherData', 'TrackStatus', 'DriverList',
-                    'RaceControlMessages', 'SessionInfo', 'SessionData', 'LapCount', 'TimingData', 'TeamRadio'
+                    'RaceControlMessages', 'SessionInfo', 'SessionData', 'LapCount', 'TimingData', 'TeamRadio',
+                    'TyreStintSeries', 'TyreStintSeries.z'
                 ]],
                 I: 1
             }));
