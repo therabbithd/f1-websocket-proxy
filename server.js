@@ -31,59 +31,168 @@ function deepObjectMerge(original = {}, modifier) {
     return copy;
 }
 
-// Helper: Decompress
+const SIGNALR_CORE_URL = 'https://livetiming.formula1.com/signalrcore';
+const F1_ORIGIN = 'https://www.formula1.com';
+const RECORD_SEPARATOR = '\x1e';
+
+const SUBSCRIBE_CHANNELS = [
+    'Heartbeat', 'CarData.z', 'Position.z', 'ExtrapolatedClock', 'TimingStats',
+    'TimingAppData', 'WeatherData', 'TrackStatus', 'DriverList',
+    'RaceControlMessages', 'SessionInfo', 'SessionData', 'LapCount', 'TimingData',
+    'TeamRadio', 'TyreStintSeries', 'TyreStintSeries.z'
+];
+
+const F1_HEADERS = {
+    'User-Agent': 'BestHTTP',
+    'Origin': F1_ORIGIN,
+    'Referer': `${F1_ORIGIN}/`,
+};
+
+function getResponseCookies(response) {
+    if (typeof response.headers.getSetCookie === 'function') {
+        return response.headers.getSetCookie().map((cookie) => cookie.split(';')[0]);
+    }
+    const raw = response.headers.get('set-cookie');
+    return raw ? [raw.split(';')[0]] : [];
+}
+
+function buildFieldUpdate(field, value) {
+    if (field.endsWith('.z') && typeof value === 'string') {
+        return { [field.split('.')[0]]: decompress(value) };
+    }
+    return { [field]: value };
+}
+
+// Helper: Decompress (Protegido contra JSONs corruptos)
 function decompress(data) {
     try {
+        if (!data) return {};
         const buffer = Buffer.from(data, 'base64');
         const inflated = pako.inflateRaw(buffer, { to: 'string' });
+        if (!inflated || !inflated.trim()) return {};
         return JSON.parse(inflated);
     } catch (e) {
+        console.error('[Decompress Error] Error de descompresion:', e.message);
         return {};
     }
 }
 
-async function startF1Broker() {
-    const SIGNALR_HUB = 'Streaming';
-    const hub = encodeURIComponent(JSON.stringify([{ name: SIGNALR_HUB }]));
+function parseSignalRFrames(rawData) {
+    return rawData.split(RECORD_SEPARATOR).filter((frame) => frame.trim().length > 1);
+}
 
-    try {
-        console.log('[Broker] Negotiating with F1...');
-        const response = await fetch(`https://livetiming.formula1.com/signalr/negotiate?connectionData=${hub}&clientProtocol=1.5`, {
-            headers: { 'User-Agent': 'BestHTTP' }
-        });
-
-        const data = await response.json();
-        const connectionToken = data.ConnectionToken;
-
-        if (!connectionToken) {
-            console.log('[Broker] No session active. Retrying in 60s...');
-            setTimeout(startF1Broker, 60000);
-            return;
+function broadcastUpdates(updates) {
+    if (updates.length === 0) return;
+    const payload = JSON.stringify(updates.length === 1 ? updates[0] : updates);
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(payload);
         }
+    });
+}
 
-        const wsUrl = `wss://livetiming.formula1.com/signalr/connect?clientProtocol=1.5&transport=webSockets&connectionToken=${encodeURIComponent(connectionToken)}&connectionData=${hub}`;
+function processSignalRFrame(frame, ws, state) {
+    let parsed;
+    try {
+        parsed = JSON.parse(frame);
+    } catch {
+        return;
+    }
+
+    if (!state.handshakeComplete && Object.keys(parsed).length === 0) {
+        state.handshakeComplete = true;
+        brokerRunning = true;
+        ws.send(JSON.stringify({
+            type: 1,
+            target: 'Subscribe',
+            arguments: [SUBSCRIBE_CHANNELS],
+            invocationId: '1',
+        }) + RECORD_SEPARATOR);
+        return;
+    }
+
+    const updates = [];
+
+    if (parsed.type === 3 && parsed.result && typeof parsed.result === 'object') {
+        const bulkUpdate = {};
+        for (const [field, value] of Object.entries(parsed.result)) {
+            Object.assign(bulkUpdate, buildFieldUpdate(field, value));
+        }
+        liveState = deepObjectMerge(liveState, bulkUpdate);
+        updates.push(bulkUpdate);
+    } else if (parsed.type === 1 && parsed.target === 'feed' && parsed.arguments?.length >= 2) {
+        const [field, value] = parsed.arguments;
+        const update = buildFieldUpdate(field, value);
+        liveState = deepObjectMerge(liveState, update);
+        updates.push(update);
+    }
+
+    broadcastUpdates(updates);
+}
+
+async function negotiateF1Connection() {
+    const cookieParts = [];
+
+    const optionsResponse = await fetch(`${SIGNALR_CORE_URL}/negotiate?negotiateVersion=1`, {
+        method: 'OPTIONS',
+        headers: F1_HEADERS,
+    });
+    cookieParts.push(...getResponseCookies(optionsResponse));
+
+    const negotiateResponse = await fetch(`${SIGNALR_CORE_URL}/negotiate?negotiateVersion=1`, {
+        method: 'POST',
+        headers: {
+            ...F1_HEADERS,
+            'Content-Length': '0',
+            ...(cookieParts.length ? { Cookie: cookieParts.join('; ') } : {}),
+        },
+    });
+
+    const textData = await negotiateResponse.text();
+    if (!negotiateResponse.ok) {
+        throw new Error(`Negotiate HTTP ${negotiateResponse.status}`);
+    }
+    if (!textData || !textData.trim()) {
+        throw new Error('Negotiate returned empty body');
+    }
+
+    const data = JSON.parse(textData);
+    if (!data.connectionToken) {
+        throw new Error('connectionToken missing in negotiate response');
+    }
+
+    cookieParts.push(...getResponseCookies(negotiateResponse));
+    return {
+        connectionToken: data.connectionToken,
+        cookie: [...new Set(cookieParts)].join('; '),
+    };
+}
+
+// Broker Core: Negociación y conexión con F1 (SignalR Core)
+async function startF1Broker() {
+    try {
+        console.log('[Broker] Negotiating with F1 SignalR Core...');
+        const { connectionToken, cookie } = await negotiateF1Connection();
+
+        const wsUrl = `wss://livetiming.formula1.com/signalrcore?id=${encodeURIComponent(connectionToken)}`;
         const ws = new WebSocket(wsUrl, {
-            headers: { 'User-Agent': 'BestHTTP' }
+            headers: {
+                ...F1_HEADERS,
+                ...(cookie ? { Cookie: cookie } : {}),
+            },
         });
+
+        const connectionState = { handshakeComplete: false };
 
         ws.on('open', () => {
-            console.log('[Broker] F1 Connection established');
-            brokerRunning = true;
-            ws.send(JSON.stringify({
-                H: SIGNALR_HUB,
-                M: 'Subscribe',
-                A: [[
-                    'Heartbeat', 'CarData.z', 'Position.z', 'ExtrapolatedClock', 'TimingStats',
-                    'TimingAppData', 'WeatherData', 'TrackStatus', 'DriverList',
-                    'RaceControlMessages', 'SessionInfo', 'SessionData', 'LapCount', 'TimingData', 'TeamRadio',
-                    'TyreStintSeries', 'TyreStintSeries.z'
-                ]],
-                I: 1
-            }));
+            console.log('[Broker] F1 WebSocket connected, sending handshake...');
+            ws.send(JSON.stringify({ protocol: 'json', version: 1 }) + RECORD_SEPARATOR);
         });
 
         ws.on('message', (data) => {
-            updateBrokerState(data.toString());
+            for (const frame of parseSignalRFrames(data.toString())) {
+                processSignalRFrame(frame, ws, connectionState);
+            }
         });
 
         ws.on('close', () => {
@@ -92,64 +201,11 @@ async function startF1Broker() {
             setTimeout(startF1Broker, 10000);
         });
 
-        ws.on('error', (err) => {
-            console.error('[Broker] F1 WS Error:', err.message);
-        });
-
+        ws.on('error', (err) => console.error('[Broker] F1 WS Error:', err.message));
     } catch (err) {
         console.error('[Broker] Fatal Error:', err.message);
+        brokerRunning = false;
         setTimeout(startF1Broker, 10000);
-    }
-}
-
-function updateBrokerState(rawData) {
-    try {
-        const parsed = JSON.parse(rawData);
-        let updates = [];
-
-        if (Array.isArray(parsed.M)) {
-            for (const message of parsed.M) {
-                if (message.M === 'feed') {
-                    let [field, value] = message.A;
-                    let update = {};
-
-                    if (field.endsWith('.z')) {
-                        const baseField = field.split('.')[0];
-                        value = decompress(value);
-                        update = { [baseField]: value };
-                    } else {
-                        update = { [field]: value };
-                    }
-
-                    liveState = deepObjectMerge(liveState, update);
-                    updates.push(update);
-                }
-            }
-        } else if (parsed.R && parsed.I === '1') {
-            const bulkUpdate = {};
-            for (let [field, value] of Object.entries(parsed.R)) {
-                if (field.endsWith('.z')) {
-                    const baseField = field.split('.')[0];
-                    bulkUpdate[baseField] = decompress(value);
-                } else {
-                    bulkUpdate[field] = value;
-                }
-            }
-            liveState = deepObjectMerge(liveState, bulkUpdate);
-            updates.push(bulkUpdate);
-        }
-
-        // Broadcast updates to all connected clients
-        if (updates.length > 0) {
-            const payload = JSON.stringify(updates.length === 1 ? updates[0] : updates);
-            wss.clients.forEach(client => {
-                if (client.readyState === WebSocket.OPEN) {
-                    client.send(payload);
-                }
-            });
-        }
-    } catch (e) {
-        // Ignore keep-alive errors
     }
 }
 
@@ -158,17 +214,14 @@ app.get('/', (req, res) => {
     res.json({ status: 'up', message: 'F1 Broker is alive' });
 });
 
-// HTTP/WS proxy for negotiate and static endpoints (fallback for clients hitting /f1-api/*)
+// HTTP/WS proxy for negotiate and static endpoints
 const f1Proxy = createProxyMiddleware({
     target: 'https://livetiming.formula1.com',
     changeOrigin: true,
     ws: true,
     pathRewrite: { '^/f1-api': '' },
-    headers: {
-        'User-Agent': 'BestHTTP'
-    },
+    headers: { 'User-Agent': 'BestHTTP' },
     onProxyReq: (proxyReq) => {
-        // Ensure the UA is set on upgrade-less requests too
         proxyReq.setHeader('User-Agent', 'BestHTTP');
     }
 });
@@ -197,18 +250,16 @@ app.get('/health', (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Broker] Server actively listening on 0.0.0.0:${PORT}`);
-    console.log(`[Broker] Detected environment PORT: ${process.env.PORT || 'not set (using 3000)'}`);
+    console.log(`[Broker] Detected environment PORT: ${process.env.PORT || 'not set (using 3001)'}`);
     startF1Broker();
 });
 
 // Handle WebSocket upgrades for clients
 server.on('upgrade', (request, socket, head) => {
-    // Proxy WS upgrades hitting /f1-api to the F1 origin
     if (request.url.startsWith('/f1-api')) {
         f1Proxy.upgrade(request, socket, head);
         return;
     }
-    // If the client asks for /f1-api/... upgrade, proxy it to F1 directly
     wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
     });
@@ -216,10 +267,8 @@ server.on('upgrade', (request, socket, head) => {
 
 wss.on('connection', (ws) => {
     console.log('[WSS] Client connected');
-    // Send current state on connection
     if (Object.keys(liveState).length > 0) {
         ws.send(JSON.stringify(liveState));
     }
-
     ws.on('close', () => console.log('[WSS] Client disconnected'));
 });
