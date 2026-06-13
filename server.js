@@ -223,6 +223,11 @@ const f1Proxy = createProxyMiddleware({
     headers: { 'User-Agent': 'BestHTTP' },
     onProxyReq: (proxyReq) => {
         proxyReq.setHeader('User-Agent', 'BestHTTP');
+    },
+    onProxyRes: (proxyRes) => {
+        proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+        proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS';
+        proxyRes.headers['Access-Control-Allow-Headers'] = '*';
     }
 });
 
